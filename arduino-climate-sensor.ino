@@ -14,27 +14,49 @@
 #define SECONDS(x) (x*1000)
 
 // Constants initialized at compile-time.
-const int           I2C_SDA         = PIN(2);
-const int           I2C_SDL         = PIN(1);
-const char          BROKER[]        = "broker.mqtthq.com";
-const int           PORT            = 1883;
-const char          TOPIC_PREFIX[]  = "devices/";
-const unsigned long UPDATE_INTERVAL = SECONDS(5);
+const int          CALLUP_PIN      = PIN(0);
+const int          SDA_PIN         = PIN(2);
+const int          SDL_PIN         = PIN(1);
+const char         BROKER[]        = "broker.mqtthq.com";
+const int          PORT            = 1883;
+const char         TOPIC_PREFIX[]  = "devices/";
 
+// Number of seconds representing the interval at which sensor values should
+// be consumed and reported.
+const unsigned int UPDATE_INTERVAL = SECONDS(5);
+
+// Number of seconds the display should be active for after being called-up
+// via the CALLUP_PIN.
+const unsigned int CALLUP_TIMEOUT  = SECONDS(30);
+
+// If the device reboots within RESET_TIMEOUT seconds after boot then the
+// device should be reset to default configuration.
+const unsigned int RESET_TIMEOUT   = SECONDS(1);
+
+//
 // Constants initialized at runtime.
+//
+
+// The unique identifier for the device.
 char DEVICE_ID[16];
-char TOPIC[sizeof(TOPIC_PREFIX) + 64];
+
+// Name of the topic that messages will be published to.
+char TOPIC[sizeof(TOPIC_PREFIX) + sizeof(DEVICE_ID)];
 
 // Runtime variables
 bool             initializing     = true;
-long             sequence         = 0;
+unsigned long    sequence         = 0;
 sensors_event_t  temperature;
 sensors_event_t  relativeHumidity;
 
 // Value of millis() when sensor values were read and reported.
-unsigned long    lastUpdateMillis;
+unsigned long    lastUpdateMillis = 0;
 
-DoubleResetDetector drd(2, 0x0);
+// Value of millis() when the screen was "turned on"
+volatile unsigned long    callupMillis = millis();
+enum { OFF, ON }          callupState  = OFF;
+
+DoubleResetDetector drd(RESET_TIMEOUT / 1000, 0x0);
 WiFiManager         wm;
 WiFiClient          client;
 PubSubClient        MQTT(client);
@@ -49,6 +71,9 @@ int die(const String& msg) {
   return 1;
 }
 
+void callup() {
+  callupMillis = millis();
+}
 
 void drawStatusArea() {
   char status[64];
@@ -103,12 +128,17 @@ void drawContentArea() {
 }
 
 void updateDisplay() {
-  SSD1306.clearDisplay();
-  
-  drawStatusArea();
-  drawContentArea();
-
-  SSD1306.display();
+  if (callupMillis + CALLUP_TIMEOUT > millis()) {
+    callupState = ON;
+    SSD1306.clearDisplay();
+    drawStatusArea();
+    drawContentArea();
+    SSD1306.display();
+  } else if (callupState == ON && callupMillis + CALLUP_TIMEOUT < millis()) {
+    callupState = OFF;
+    SSD1306.clearDisplay();
+    SSD1306.display();
+  }
 }
 
 void setup() {
@@ -116,9 +146,14 @@ void setup() {
   
   // Check for a double-reset indicating that the device should be restored to its default state.
   if (drd.detectDoubleReset()) {
-    Serial.println("Double Reset Detected");
     wm.resetSettings();
   }
+
+
+  // Add the interrupt handler for the callup button.
+  pinMode(CALLUP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(CALLUP_PIN), callup, FALLING);
+
 
   // Initialize runtime constants
   snprintf(DEVICE_ID, sizeof(DEVICE_ID), "%012llx", ESP.getEfuseMac());
@@ -126,7 +161,7 @@ void setup() {
 
 
   // Setup peripherals
-  Wire.setPins(I2C_SDA, I2C_SDL) || die(F("I2C pin configuration failed"));
+  Wire.setPins(SDA_PIN, SDL_PIN) || die(F("I2C pin configuration failed"));
   Wire.begin() || die(F("I2C initialized failed"));
   AHT10.begin() || die(F("AHT not available"));
   SSD1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true) || die(F("SSD1306 not available"));
@@ -137,6 +172,7 @@ void setup() {
   // Configure the WiFi Manager
   std::vector<const char*> menu = {"wifi", "param", "info", "update"};
   wm.setMenu(menu);
+  wm.setSaveConfigCallback(callup);
   wm.setConfigPortalBlocking(false);
 
 
@@ -193,12 +229,10 @@ void loop() {
 
   // Read sensors, update the display, and publish messages if a reasonable amount of
   // time has passed.
-  if (millis() > lastUpdateMillis + UPDATE_INTERVAL) {
+  if (lastUpdateMillis == 0 || millis() > lastUpdateMillis + UPDATE_INTERVAL) {
     // Read the values from the sensor
     AHT10.getEvent(&relativeHumidity, &temperature);
 
-    updateDisplay(); 
-    
     lastUpdateMillis = millis();
 
     // Build the MQTT message
@@ -219,4 +253,8 @@ void loop() {
     MQTT.publish(TOPIC, message.c_str());
   }
 
+
+  // Update the information displayed on screen, or turn the screen off if the callup
+  // has expired.
+  updateDisplay();
 }
