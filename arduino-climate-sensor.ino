@@ -1,37 +1,15 @@
-
-#define DOUBLERESETDETECTOR_DEBUG false
-#define ESP_DRD_USE_SPIFFS true
+#include "config.h"
 
 #include <WiFi.h>
+#if MQTT_USE_TLS
+  #include <WiFiClientSecure.h>
+#endif
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFiManager.h>
 #include <ESP_DoubleResetDetector.h>
-
-#define PIN(x) x
-#define SECONDS(x) (x*1000)
-
-// Constants initialized at compile-time.
-const int          CALLUP_PIN      = PIN(0);
-const int          SDA_PIN         = PIN(2);
-const int          SDL_PIN         = PIN(1);
-const char         BROKER[]        = "broker.mqtthq.com";
-const int          PORT            = 1883;
-const char         TOPIC_PREFIX[]  = "devices/";
-
-// Number of seconds representing the interval at which sensor values should
-// be consumed and reported.
-const unsigned int UPDATE_INTERVAL = SECONDS(5);
-
-// Number of seconds the display should be active for after being called-up
-// via the CALLUP_PIN.
-const unsigned int CALLUP_TIMEOUT  = SECONDS(30);
-
-// If the device reboots within RESET_TIMEOUT seconds after boot then the
-// device should be reset to default configuration.
-const unsigned int RESET_TIMEOUT   = SECONDS(1);
 
 //
 // Constants initialized at runtime.
@@ -41,25 +19,22 @@ const unsigned int RESET_TIMEOUT   = SECONDS(1);
 char DEVICE_ID[16];
 
 // Name of the topic that messages will be published to.
-char TOPIC[sizeof(TOPIC_PREFIX) + sizeof(DEVICE_ID)];
+char TOPIC[sizeof(MQTT_TOPIC_PREFIX) + sizeof(DEVICE_ID) + 1];
 
+//
 // Runtime variables
+//
 bool             initializing     = true;
-unsigned long    sequence         = 0;
 sensors_event_t  temperature;
 sensors_event_t  relativeHumidity;
-
-// Value of millis() when sensor values were read and reported.
-unsigned long    lastUpdateMillis = 0;
 
 // Value of millis() when the screen was "turned on"
 volatile unsigned long    callupMillis = millis();
 enum { OFF, ON }          callupState  = OFF;
 
-DoubleResetDetector drd(RESET_TIMEOUT / 1000, 0x0);
+DoubleResetDetector drd(DRD_RESET_TIMEOUT_MS / 1000, 0x0);
 WiFiManager         wm;
-WiFiClient          client;
-PubSubClient        MQTT(client);
+PubSubClient        MQTT;
 Adafruit_AHTX0      AHT10;
 Adafruit_SSD1306    SSD1306(128, 64);
 
@@ -128,13 +103,13 @@ void drawContentArea() {
 }
 
 void updateDisplay() {
-  if (callupMillis + CALLUP_TIMEOUT > millis()) {
+  if (callupMillis + CALLUP_TIMEOUT_MS > millis()) {
     callupState = ON;
     SSD1306.clearDisplay();
     drawStatusArea();
     drawContentArea();
     SSD1306.display();
-  } else if (callupState == ON && callupMillis + CALLUP_TIMEOUT < millis()) {
+  } else if (callupState == ON && callupMillis + CALLUP_TIMEOUT_MS < millis()) {
     callupState = OFF;
     SSD1306.clearDisplay();
     SSD1306.display();
@@ -145,7 +120,7 @@ void setup() {
   Serial.begin(115200);
   
   // Check for a double-reset indicating that the device should be restored to its default state.
-  if (drd.detectDoubleReset()) {
+  if (DRD_RESET_TIMEOUT_MS > 0 && drd.detectDoubleReset()) {
     wm.resetSettings();
   }
 
@@ -157,11 +132,11 @@ void setup() {
 
   // Initialize runtime constants
   snprintf(DEVICE_ID, sizeof(DEVICE_ID), "%012llx", ESP.getEfuseMac());
-  snprintf(TOPIC, sizeof(TOPIC), "%s%s", TOPIC_PREFIX, DEVICE_ID);
+  snprintf(TOPIC, sizeof(TOPIC), "%s%s", MQTT_TOPIC_PREFIX, DEVICE_ID);
 
 
   // Setup peripherals
-  Wire.setPins(SDA_PIN, SDL_PIN) || die(F("I2C pin configuration failed"));
+  Wire.setPins(SDA_PIN, SCL_PIN) || die(F("I2C pin configuration failed"));
   Wire.begin() || die(F("I2C initialized failed"));
   AHT10.begin() || die(F("AHT not available"));
   SSD1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true) || die(F("SSD1306 not available"));
@@ -180,9 +155,17 @@ void setup() {
   // then the configuration portal will automatically be started.
   wm.autoConnect();
 
-  
-  // Setup MQTT
-  MQTT.setServer(BROKER, PORT);
+
+  // Setup WiFiClient (or WiFiClientSecure) and MQTT
+  Client* client;
+  #if MQTT_USE_TLS
+    client = new WiFiClientSecure();
+    static_cast<WiFiClientSecure*>(client)->setCACert(MQTT_CA_CERT);
+  #else
+    client = new WiFiClient();
+  #endif
+  MQTT.setClient(*client);
+  MQTT.setServer(MQTT_BROKER, MQTT_PORT);
 
 
   // Indicate that setup() is complete.
@@ -193,7 +176,7 @@ void loop() {
   // Clean up the Double Reset Detector state.
   drd.loop();
 
-  
+
   // Do WiFiManager related processing.
   wm.process();
 
@@ -203,22 +186,19 @@ void loop() {
   // started to allow re-configuration.
   wm.startWebPortal();
 
-  
+
   // Connect to the MQTT broker if not already connected.  This will block until a connection
   // has been established.
   if (WiFi.isConnected() && !MQTT.connected()) {
-    Serial.printf("Connecting to %s:%d...\n", BROKER, PORT);
-    while (!MQTT.connected()) {
-      char clientId[64];
-      snprintf(clientId, sizeof(clientId), "device-%s-%x", DEVICE_ID, random() * 1000);
-      Serial.print(".");
-      MQTT.connect(clientId);
-      if (!MQTT.connected()) {
-        delay(5000);
-      } else {
-        Serial.println();
-        Serial.println("Connected.");
-      }
+    Serial.printf("Connecting to %s:%d...", MQTT_BROKER, MQTT_PORT);
+    char clientId[64];
+    snprintf(clientId, sizeof(clientId), "device-%s-%x", DEVICE_ID, random() * 1000);
+    Serial.print(".");
+    MQTT.connect(clientId, MQTT_USERNAME, MQTT_PASSWORD);
+    if (!MQTT.connected()) {
+      delay(5000);
+    } else {
+      Serial.println("Connected.");
     }
   }
 
@@ -229,13 +209,15 @@ void loop() {
 
   // Read sensors, update the display, and publish messages if a reasonable amount of
   // time has passed.
-  if (lastUpdateMillis == 0 || millis() > lastUpdateMillis + UPDATE_INTERVAL) {
+  static unsigned long lastUpdateMillis = 0;
+  if (lastUpdateMillis == 0 || millis() > lastUpdateMillis + UPDATE_INTERVAL_MS) {
     // Read the values from the sensor
     AHT10.getEvent(&relativeHumidity, &temperature);
 
     lastUpdateMillis = millis();
 
     // Build the MQTT message
+    static unsigned long sequence = 0;
     String message;
     DynamicJsonDocument doc(1024);
     doc[F("deviceId")] = DEVICE_ID;
